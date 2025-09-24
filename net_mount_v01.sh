@@ -1,30 +1,45 @@
 #!/usr/bin/env bash
-# net_mount_v01.sh — ultra-simple starter menu
+# net_mount_v01.sh — whiptail starter with ASCII welcome screen
 
+# ASCII art for welcome
+ASCII_ART="
+   ____ _ _       ___  ___  ___  
+  / ___(_) |_ ___| _ \\/ _ \\/ _ \\ 
+ | |   | |  _/ -_)  _/ (_) |   / 
+ |_|   |_|\\__\\___|_|  \\___/|_|_\\ 
+                                
+            Cile022
+"
+
+# Show welcome splash
+whiptail --title "Welcome" --msgbox "$ASCII_ART\n\nWelcome to the SMB Helper Script!" 15 60
+
+# Main menu loop
 while true; do
-  echo
-  echo "========================"
-  echo "   Simple Menu (v0.1)   "
-  echo "========================"
-  echo "1) Option 1"
-  echo "2) Option 2"
-  echo "3) Exit"
-  echo -n "Choose an option [1-3]: "
-  read -r choice
+  CHOICE=$(whiptail --title "Simple Menu (v0.1)" --menu "Choose an option:" 15 50 4 \
+    "1" "Option 1" \
+    "2" "Option 2" \
+    "3" "Exit script" 3>&1 1>&2 2>&3)
 
-  case "$choice" in
+  exitstatus=$?
+  if [ $exitstatus -ne 0 ]; then
+    whiptail --title "Exit" --msgbox "Cancelled. Exiting script." 8 40
+    exit 0
+  fi
+
+  case "$CHOICE" in
     1)
-      echo "Option 1 selected"
+      whiptail --title "Result" --msgbox "Option 1 selected" 8 40
       ;;
     2)
-      echo "Option 2 selected"
+      whiptail --title "Result" --msgbox "Option 2 selected" 8 40
       ;;
     3)
-      echo "Exiting script. Bye!"
+      whiptail --title "Exit" --msgbox "Exiting script. Bye!" 8 40
       exit 0
       ;;
     *)
-      echo "Invalid selection. Please choose 1, 2, or 3."
+      whiptail --title "Error" --msgbox "Invalid choice." 8 40
       ;;
   esac
 done
