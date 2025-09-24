@@ -1,51 +1,50 @@
 #!/usr/bin/env bash
-# proxmox-helper.sh
+# smb-autocfg.sh
+# Debian/Ubuntu helper to scan network for SMB servers, list shares, create credentials, mount and add fstab entries with systemd automount.
+# Usage: sudo ./smb-autocfg.sh
 set -Eeuo pipefail
+IFS=$'\n\t'
 
-#============= CONFIG / GLOBALS =============#
-DRY_RUN=0
-MENU_TOOL=""
-DEFAULT_BRIDGE="vmbr0"
-DEFAULT_STORAGE="local-lvm"
-DEFAULT_ISO_STORAGE="local"
-DEFAULT_BACKUP_STORAGE="local"
+LOGFILE="/var/log/smb-mount-script.log"
+CREDFOLDER="/etc/samba"
+MNTROOT="/mnt"
+FSTAB="/etc/fstab"
 
-#============= UTILITIES =============#
-log()  { printf "[%s] %s\n" "$(date +'%F %T')" "$*" >&2; }
-die()  { log "ERROR: $*"; exit 1; }
-shdry(){ if ((DRY_RUN)); then echo "[dry-run] $*"; else eval "$@"; fi; }
-
-need_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root."
+# ===== helpers =====
+log() {
+  local ts; ts="$(date +'%F %T')"
+  echo "[$ts] $*" | tee -a "$LOGFILE"
 }
 
-need_proxmox() {
-  command -v pveversion >/dev/null 2>&1 || die "This script must run on Proxmox VE."
+die() { echo "ERROR: $*" | tee -a "$LOGFILE" >&2; exit 1; }
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "This script must be run as root. Use sudo."
+  fi
 }
 
 pick_menu_tool() {
   if command -v whiptail >/dev/null 2>&1; then MENU_TOOL="whiptail"
-  elif command -v dialog >/dev/null 2>&1;  then MENU_TOOL="dialog"
+  elif command -v dialog >/dev/null 2>&1; then MENU_TOOL="dialog"
   else MENU_TOOL="none"; fi
 }
 
 menu() {
-  # $1=title, $2=height, $3=width, shift 3 => items "tag desc" ...
-  if [[ $MENU_TOOL == "whiptail" ]]; then
+  # menu title height width [tag desc]...
+  if [[ "$MENU_TOOL" == "whiptail" ]]; then
     whiptail --clear --title "$1" --menu "$1" "$2" "$3" 10 "${@:4}" 3>&1 1>&2 2>&3
-  elif [[ $MENU_TOOL == "dialog" ]]; then
+  elif [[ "$MENU_TOOL" == "dialog" ]]; then
     dialog --clear --title "$1" --menu "$1" "$2" "$3" 10 "${@:4}" 3>&1 1>&2 2>&3
   else
-    # naive fallback
-    echo "$1"
-    local i=1; while (( "$#" )); do
-      shift 3 || true; break
-    done
-    local idx=1
-    while (( "$#" )); do
-      local tag="$1"; local desc="$2"; shift 2 || true
-      printf "  %d) %s - %s\n" "$idx" "$tag" "$desc"
-      idx=$((idx+1))
+    # simple fallback: print menu
+    echo "=== $1 ==="
+    local i=1
+    local args=("$@")
+    # skip first 3 args: title,h,w
+    for ((idx=4; idx<${#args[@]}; idx+=2)); do
+      printf "%3d) %s - %s\n" "$i" "${args[idx-1]}" "${args[idx]}"
+      i=$((i+1))
     done
     read -rp "Choose number: " choice
     echo "$choice"
@@ -53,286 +52,373 @@ menu() {
 }
 
 input_box() {
-  # $1=title $2=prompt $3=default
-  if [[ $MENU_TOOL == "whiptail" ]]; then
-    whiptail --inputbox "$2" 10 70 "$3" 3>&1 1>&2 2>&3
-  elif [[ $MENU_TOOL == "dialog" ]]; then
-    dialog --inputbox "$2" 10 70 "$3" 3>&1 1>&2 2>&3
+  local title="$1" prompt="$2" default="${3:-}"
+  if [[ "$MENU_TOOL" == "whiptail" ]]; then
+    whiptail --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
+  elif [[ "$MENU_TOOL" == "dialog" ]]; then
+    dialog --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
   else
-    read -rp "$2 [$3]: " val; echo "${val:-$3}"
+    read -rp "$prompt [$default]: " val
+    echo "${val:-$default}"
   fi
 }
 
 password_box() {
-  if [[ $MENU_TOOL == "whiptail" ]]; then
-    whiptail --passwordbox "Enter password" 10 70 3>&1 1>&2 2>&3
-  elif [[ $MENU_TOOL == "dialog" ]]; then
-    dialog --passwordbox "Enter password" 10 70 3>&1 1>&2 2>&3
+  local prompt="${1:-Enter password: }"
+  if [[ "$MENU_TOOL" == "whiptail" ]]; then
+    whiptail --passwordbox "$prompt" 10 70 3>&1 1>&2 2>&3
+  elif [[ "$MENU_TOOL" == "dialog" ]]; then
+    dialog --passwordbox "$prompt" 10 70 3>&1 1>&2 2>&3
   else
-    read -rsp "Enter password: " val; echo; echo "$val"
-  fi
-}
-
-msgbox() {
-  local txt="$1"
-  if [[ $MENU_TOOL == "whiptail" ]]; then
-    whiptail --msgbox "$txt" 12 70
-  elif [[ $MENU_TOOL == "dialog" ]]; then
-    dialog --msgbox "$txt" 12 70
-  else
-    echo -e "$txt"
+    read -rsp "$prompt" val; echo; echo "$val"
   fi
 }
 
 confirm() {
   local q="${1:-Are you sure?}"
-  if [[ $MENU_TOOL == "whiptail" ]]; then
+  if [[ "$MENU_TOOL" == "whiptail" ]]; then
     whiptail --yesno "$q" 8 60
     return $?
-  elif [[ $MENU_TOOL == "dialog" ]]; then
+  elif [[ "$MENU_TOOL" == "dialog" ]]; then
     dialog --yesno "$q" 8 60
     return $?
   else
-    read -rp "$q [y/N]: " yn; [[ ${yn,,} == y* ]]
+    read -rp "$q [y/N]: " ans; [[ "${ans,,}" =~ ^y(es)?$ ]]
+    return $?
   fi
 }
 
-#============= TASKS =============#
-task_update_system() {
-  log "Updating apt & Proxmox packages"
-  shdry apt-get update
-  shdry apt-get -y dist-upgrade
-  shdry apt-get -y autoremove --purge
-}
-
-task_refresh_templates() {
-  log "Refreshing LXC template index (pveam update)"
-  shdry pveam update
-}
-
-task_list_templates() {
-  log "Listing LXC templates (top 30)"
-  pveam available | sort | tail -n +1 | head -n 30
-}
-
-task_create_lxc_interactive() {
-  log "Interactive LXC creation"
-  local ctid hostname storage template pw cores mem bridge
-  ctid=$(input_box "LXC" "CT ID (e.g., 101)" "101")
-  hostname=$(input_box "LXC" "Hostname" "lxc-$ctid")
-  storage=$(input_box "LXC" "Storage (thin block or dir)" "$DEFAULT_STORAGE")
-  bridge=$(input_box "LXC" "Network bridge" "$DEFAULT_BRIDGE")
-  cores=$(input_box "LXC" "CPU cores" "2")
-  mem=$(input_box "LXC" "Memory (MiB)" "2048")
-
-  # pick template
-  log "Fetching templates…"
-  local tmpl_list
-  tmpl_list=$(pveam available | awk '{print $1}' | grep -E '\.tar\.(gz|xz)$' || true)
-  if [[ -z "$tmpl_list" ]]; then
-    msgbox "No templates found. Run 'Refresh templates' first."
-    return 1
-  fi
-  # simplest: auto-pick debian bookworm if exists, else the first
-  local default_tmpl
-  default_tmpl=$(echo "$tmpl_list" | grep -m1 -E 'debian.*bookworm.*amd64' || true)
-  template=$(input_box "LXC" "Template (exact from 'pveam available')" "${default_tmpl:-$(echo "$tmpl_list" | head -n1)}")
-
-  pw=$(password_box)
-
-  # Ensure template is downloaded to storage (dir)
-  local tmpl_store="local"
-  if ! pveam list "$tmpl_store" | grep -q "$(basename "$template")"; then
-    log "Downloading template to $tmpl_store: $template"
-    shdry pveam download "$tmpl_store" "$template"
-  fi
-  local tmpl_path="/var/lib/vz/template/cache/$(basename "$template")"
-  [[ -f "$tmpl_path" ]] || die "Template not present at $tmpl_path"
-
-  confirm "Create LXC CTID $ctid ($hostname) on $storage?" || { log "Canceled."; return; }
-
-  shdry pct create "$ctid" "$tmpl_path" \
-    -hostname "$hostname" \
-    -password "$pw" \
-    -storage "$storage" \
-    -net0 "name=eth0,bridge=$bridge,ip=dhcp" \
-    -cores "$cores" \
-    -memory "$mem" \
-    -onboot 1
-
-  shdry pct start "$ctid"
-  msgbox "LXC $ctid ($hostname) created and started."
-}
-
-task_create_vm_interactive() {
-  log "Interactive VM creation"
-  local vmid name iso_storage iso_file storage cores mem disk_gb bridge
-  vmid=$(input_box "VM" "VMID (e.g., 200)" "200")
-  name=$(input_box "VM" "Name" "vm-$vmid")
-  iso_storage=$(input_box "VM" "ISO storage (content=iso)" "$DEFAULT_ISO_STORAGE")
-
-  # pick ISO
-  local iso_list
-  iso_list=$(pvesh get /nodes/$(hostname)/storage/$iso_storage/content | jq -r '.[] | select(.content=="iso") | .volid' 2>/dev/null || true)
-  if [[ -z "$iso_list" ]]; then
-    msgbox "No ISOs on storage '$iso_storage'. Upload an ISO first (Datacenter → Storage → ISO)."
-    return 1
-  fi
-  local default_iso
-  default_iso=$(echo "$iso_list" | head -n1)
-  iso_file=$(input_box "VM" "ISO volid (exact)" "$default_iso")
-
-  storage=$(input_box "VM" "Disk storage" "$DEFAULT_STORAGE")
-  cores=$(input_box "VM" "CPU cores" "2")
-  mem=$(input_box "VM" "Memory (MiB)" "4096")
-  disk_gb=$(input_box "VM" "Disk size (GB)" "32")
-  bridge=$(input_box "VM" "Network bridge" "$DEFAULT_BRIDGE")
-
-  confirm "Create VM $vmid ($name) using $iso_file?" || { log "Canceled."; return; }
-
-  shdry qm create "$vmid" --name "$name" --ostype l26
-  shdry qm set "$vmid" --memory "$mem" --cores "$cores" --cpu host
-  shdry qm set "$vmid" --scsihw virtio-scsi-pci --scsi0 "$storage:$((${disk_gb}))"
-  shdry qm set "$vmid" --ide2 "$iso_file",media=cdrom
-  shdry qm set "$vmid" --boot order=scsi0;ide2
-  shdry qm set "$vmid" --net0 virtio,bridge="$bridge"
-  shdry qm set "$vmid" --agent enabled=1
-  shdry qm start "$vmid"
-  msgbox "VM $vmid ($name) created and started."
-}
-
-task_backup_interactive() {
-  log "Interactive backup"
-  local target what
-  target=$(input_box "Backup" "Backup storage (content=backup)" "$DEFAULT_BACKUP_STORAGE")
-  what=$(input_box "Backup" "Guest ID(s) (e.g., 101 or 101,102)" "")
-  [[ -z "$what" ]] && die "No guest IDs provided."
-  confirm "Run vzdump to $target for $what?" || { log "Canceled."; return; }
-  shdry vzdump $what --storage "$target" --mode snapshot --compress zstd
-  msgbox "Backup triggered for: $what"
-}
-
-task_clean_images() {
-  log "Cleaning unused templates, cache & orphaned images (safe)"
-  shdry pveam update
-  # Clean template cache older than 60 days
-  find /var/lib/vz/template/cache -type f -mtime +60 -name "*.tar.*" -print -exec bash -c '((DRY_RUN)) && echo "[dry-run] rm -f \"$1\"" || rm -f "$1"' _ {} \;
-  # Show orphaned volumes on local-lvm (manual action advised)
-  log "Listing possibly orphaned volumes on $DEFAULT_STORAGE (manual remove via GUI recommended):"
-  lvs | awk 'NR==1 || $1 ~ /^vm|^base/ {print}'
-}
-
-task_update_all_lxc() {
-  log "Updating all running LXC containers (apt-get dist-upgrade)"
-  local ids
-  ids=$(pct list | awk 'NR>1 {print $1}')
-  [[ -z "$ids" ]] && { log "No containers found."; return; }
-  for id in $ids; do
-    log "Updating CT $id"
-    if ((DRY_RUN)); then
-      echo "[dry-run] pct exec $id -- sh -c 'apt-get update && apt-get -y dist-upgrade && apt-get -y autoremove --purge'"
-    else
-      pct exec "$id" -- sh -c 'apt-get update && apt-get -y dist-upgrade && apt-get -y autoremove --purge'
+ensure_deps() {
+  local need=(nmap smbclient cifs-utils)
+  local to_install=()
+  for p in "${need[@]}"; do
+    if ! command -v "$p" >/dev/null 2>&1; then
+      to_install+=("$p")
     fi
   done
-  msgbox "Updates complete."
+  if (( ${#to_install[@]} )); then
+    log "Missing packages: ${to_install[*]}. Installing..."
+    apt-get update -y >>"$LOGFILE" 2>&1
+    apt-get install -y "${to_install[@]}" >>"$LOGFILE" 2>&1 || die "Failed to install packages: ${to_install[*]}"
+    log "Installed packages."
+  else
+    log "All dependencies present."
+  fi
 }
 
-#============= MENU =============#
-show_menu() {
-  pick_menu_tool
-  while true; do
+detect_network_range() {
+  # prefer default route's interface
+  local iface ip cidr
+  iface=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' || true)
+  if [[ -n "$iface" ]]; then
+    ip=$(ip -4 -o addr show dev "$iface" | awk '{print $4}' | head -n1 || true)
+  fi
+  if [[ -z "${ip:-}" ]]; then
+    # fallback: first non-loopback
+    ip=$(ip -4 -o addr show scope global | awk '{print $4; exit}' || true)
+  fi
+  if [[ -z "${ip:-}" ]]; then
+    read -rp "Could not detect network range. Enter CIDR (e.g. 192.168.1.0/24): " ip
+  else
+    # confirm with user
+    read -rp "Detected network range '$ip'. Press Enter to use or type another CIDR: " resp
+    if [[ -n "$resp" ]]; then ip="$resp"; fi
+  fi
+  echo "$ip"
+}
+
+scan_for_smb_hosts() {
+  local range="$1"
+  log "Scanning $range for SMB hosts (this may take a while)..."
+  # Use nmap to find hosts with port 445 open. -Pn to skip ping (faster in some networks).
+  # Output grepable mode and parse IPs
+  local nmap_out
+  nmap_out=$(nmap -p 445 --open -T4 -Pn "$range" -oG - 2>>"$LOGFILE") || true
+  # parse hosts lines
+  local hosts=()
+  while IFS= read -r l; do
+    if [[ "$l" =~ Host:\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      hosts+=("${BASH_REMATCH[1]}")
+    fi
+  done <<<"$nmap_out"
+  # dedupe
+  mapfile -t hosts < <(printf "%s\n" "${hosts[@]}" | awk '!seen[$0]++')
+  echo "${hosts[@]}"
+}
+
+choose_from_list() {
+  # args: title, prompt, items... (items are simple strings)
+  local title="$1"; shift
+  local prompt="$1"; shift
+  local items=("$@")
+  if [[ "$MENU_TOOL" == "whiptail" || "$MENU_TOOL" == "dialog" ]]; then
+    # build tag desc pairs (tag=index)
+    local params=()
+    local i=1
+    for it in "${items[@]}"; do
+      params+=("$i" "$it")
+      i=$((i+1))
+    done
     local choice
-    choice=$(menu "Proxmox Helper" 20 78 \
-      U "Update host system" \
-      R "Refresh LXC templates (pveam)" \
-      L "List LXC templates" \
-      X "Create LXC (interactive)" \
-      V "Create VM (interactive)" \
-      B "Backup guest(s) (interactive)" \
-      A "Update all LXC (apt)" \
-      C "Clean old template cache" \
-      Q "Quit") || true
+    choice=$(menu "$title" 20 78 "${#items[@]}" "${params[@]}")
+    if [[ -z "$choice" ]]; then
+      echo ""
+      return
+    fi
+    # if numeric tag returned -> map to item
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      echo "${items[$((choice-1))]}"
+      return
+    fi
+    # otherwise return raw
+    echo "$choice"
+  else
+    # fallback simple numbered prompt (allow multiple selection comma-separated)
+    echo "=== $title ==="
+    local idx=1
+    for it in "${items[@]}"; do
+      printf "%3d) %s\n" "$idx" "$it"
+      idx=$((idx+1))
+    done
+    read -rp "$prompt (enter number or comma list): " sel
+    if [[ -z "$sel" ]]; then echo ""; return; fi
+    # support comma-separated
+    local out=()
+    IFS=',' read -ra arr <<<"$sel"
+    for v in "${arr[@]}"; do
+      v="${v// /}"
+      if [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=${#items[@]} )); then
+        out+=("${items[$((v-1))]}")
+      fi
+    done
+    printf "%s\n" "${out[@]}"
+  fi
+}
 
-    # dialog/whiptail returns string tags; fallback returns number
-    case "$choice" in
-      1|U) task_update_system;;
-      2|R) task_refresh_templates;;
-      3|L) task_list_templates | ${PAGER:-cat};;
-      4|X) task_create_lxc_interactive;;
-      5|V) task_create_vm_interactive;;
-      6|B) task_backup_interactive;;
-      7|A) task_update_all_lxc;;
-      8|C) task_clean_images;;
-      9|Q|"" ) break;;
-      *) msgbox "Invalid choice: $choice";;
-    esac
+list_shares_on_server() {
+  local server="$1"
+  local credfile="$2"
+  # use smbclient -L with credential file (-A)
+  log "Querying shares on //$server ..."
+  smbclient -L "//$server" -A "$credfile" 2>>"$LOGFILE" | sed -n '/Sharename/,/Server\|$/{/Sharename/!p}' | awk '{$1=$1;print}' || true
+}
+
+create_credentials_file() {
+  local server="$1" user="$2" pass="$3"
+  mkdir -p "$CREDFOLDER"
+  local file="$CREDFOLDER/credentials_${server}"
+  # write username/password in smbclient format
+  {
+    echo "username=${user}"
+    echo "password=${pass}"
+  } >"$file"
+  chmod 600 "$file"
+  chown root:root "$file"
+  log "Wrote credentials to $file (mode 600)"
+  echo "$file"
+}
+
+create_mount_and_fstab_entry() {
+  local server="$1" share="$2" credfile="$3" uid="${4:-0}" gid="${5:-0}"
+  # sanitize share name for path
+  local share_safe sharepath
+  share_safe=$(echo "$share" | sed 's#[/:]#_#g')
+  sharepath="$MNTROOT/$server/$share_safe"
+  mkdir -p "$sharepath"
+  chown root:root "$sharepath"
+  chmod 755 "$sharepath"
+  # fstab entry
+  local esc_share="//${server}/${share}"
+  # create fstab options: use uid/gid if specified (if UID !=0 probably user wants own mounts)
+  local opts="credentials=${credfile},_netdev,noauto,x-systemd.automount,x-systemd.requires=network-online.target,x-systemd.after=network-online.target,iocharset=utf8"
+  if [[ "$uid" -ne 0 || "$gid" -ne 0 ]]; then
+    opts+=",uid=${uid},gid=${gid}"
+  fi
+  # escape spaces: fstab requires \040 for space; replace spaces with \040
+  esc_share="${esc_share// /\\040}"
+  local esc_mount="${sharepath// /\\040}"
+  # append to /etc/fstab if not already present
+  if ! grep -Fq "$esc_share" "$FSTAB"; then
+    printf "%s %s cifs %s 0 0\n" "$esc_share" "$esc_mount" "$opts" >>"$FSTAB"
+    log "Added fstab entry for //$server/$share -> $sharepath"
+  else
+    log "Fstab already contains //$server/$share; skipping fstab append"
+  fi
+  # try immediate mount (systemd automount will create .automount unit; mounting via mount may mount now)
+  if mountpoint -q "$sharepath"; then
+    log "$sharepath already mounted"
+  else
+    # attempt mount (this will trigger systemd automount) — use mount command to activate automount
+    if mount "$sharepath" 2>>"$LOGFILE"; then
+      log "Mounted //$server/$share on $sharepath"
+    else
+      log "Attempted mount via mount command (systemd automount should handle it), mount may occur on access."
+    fi
+  fi
+
+  echo "$sharepath"
+}
+
+# ===== main flow =====
+require_root
+pick_menu_tool
+mkdir -p "$(dirname "$LOGFILE")"
+touch "$LOGFILE"
+log "=== smb-autocfg started ==="
+
+ensure_deps
+
+# network detection
+NETRANGE="$(detect_network_range)"
+if [[ -z "$NETRANGE" ]]; then
+  die "No network range given. Exiting."
+fi
+
+# scan
+hosts_raw=()
+mapfile -t hosts_raw < <(scan_for_smb_hosts "$NETRANGE")
+if (( ${#hosts_raw[@]} == 0 )); then
+  log "No SMB hosts found on $NETRANGE."
+  echo "No SMB hosts found on $NETRANGE. Exiting."
+  exit 0
+fi
+log "Found ${#hosts_raw[@]} host(s): ${hosts_raw[*]}"
+
+# let user pick one or more servers
+echo
+if [[ "$MENU_TOOL" == "whiptail" || "$MENU_TOOL" == "dialog" ]]; then
+  # use simple single-select menu; allow repeated runs to process multiple servers
+  while true; do
+    srv=$(choose_from_list "SMB Servers" "Select a server to configure (or Cancel/empty to finish):" "${hosts_raw[@]}")
+    if [[ -z "$srv" ]]; then break; fi
+    SELECTED_SERVERS+=("$srv")
+    # remove selected from hosts list so user won't pick again
+    newhosts=()
+    for h in "${hosts_raw[@]}"; do [[ "$h" != "$srv" ]] && newhosts+=("$h"); done
+    hosts_raw=("${newhosts[@]}")
+    if (( ${#hosts_raw[@]} == 0 )); then break; fi
+    if ! confirm "Configure another server?"; then break; fi
   done
-}
+else
+  # fallback: allow comma-separated picks
+  echo "Select one or more servers from the list (comma separated):"
+  idx=1
+  for h in "${hosts_raw[@]}"; do printf "%3d) %s\n" "$idx" "$h"; idx=$((idx+1)); done
+  read -rp "Enter numbers (e.g. 1,3): " picknums
+  IFS=',' read -ra arr <<<"$picknums"
+  for v in "${arr[@]}"; do v="${v// /}"; if [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=${#hosts_raw[@]} )); then SELECTED_SERVERS+=("${hosts_raw[$((v-1))]}"); fi; done
+fi
 
-#============= CLI ARG PARSING =============#
-usage() {
-cat <<EOF
-Proxmox Helper Script
+if (( ${#SELECTED_SERVERS[@]} == 0 )); then
+  log "No servers selected. Exiting."
+  echo "No servers selected. Exiting."
+  exit 0
+fi
 
-Usage:
-  $0 [options]
+# For each selected server: ask credentials -> create credfile -> list shares -> pick shares -> mount & fstab
+CREATED_CRED_FILES=()
+CREATED_MOUNTS=()
+for server in "${SELECTED_SERVERS[@]}"; do
+  log "Processing server: $server"
+  # username
+  user_default="$(whoami)"
+  user=$(input_box "Credentials for $server" "Username for //$server (domain\\user or user):" "$user_default")
+  pass=$(password_box "Password for $user@$server: ")
+  credfile=$(create_credentials_file "$server" "$user" "$pass")
+  CREATED_CRED_FILES+=("$credfile")
 
-Options:
-  --menu                  Launch interactive TUI menu.
-  --update                Update host (apt dist-upgrade, autoremove).
-  --refresh-templates     Refresh LXC template index (pveam update).
-  --list-templates        List available LXC templates.
-  --create-lxc            Interactive LXC creation wizard.
-  --create-vm             Interactive VM creation wizard.
-  --backup                Interactive backup (vzdump).
-  --update-all-lxc        apt update/upgrade in all containers.
-  --clean                 Clean old template caches (safe).
-  --dry-run               Print commands without executing.
-  -h, --help              Show this help.
+  # list shares
+  shares_raw=$(list_shares_on_server "$server" "$credfile")
+  # parse share names: smbclient output has a table like:
+  # Sharename       Type      Comment
+  # ---------       ----      -------
+  # share           Disk      ...
+  # We'll parse third column lines: first word is sharename
+  mapfile -t shares < <(printf "%s\n" "$shares_raw" | awk 'NF && $1!~/^(Sharename|Server|IPC$|Comment|-----)/ {print $1}')
+  # dedupe
+  mapfile -t shares < <(printf "%s\n" "${shares[@]}" | awk '!seen[$0]++')
+  if (( ${#shares[@]} == 0 )); then
+    log "No shares discovered on //$server (or access denied). Output from smbclient below:"
+    echo "---- smbclient output (tail 40) ----"
+    printf "%s\n" "$shares_raw" | tail -n 40
+    echo "------------------------------------"
+    if ! confirm "No shares found or access denied. Continue to next server?"; then
+      die "User aborted."
+    else
+      continue
+    fi
+  fi
 
-Environment defaults:
-  DEFAULT_BRIDGE="$DEFAULT_BRIDGE"
-  DEFAULT_STORAGE="$DEFAULT_STORAGE"
-  DEFAULT_ISO_STORAGE="$DEFAULT_ISO_STORAGE"
-  DEFAULT_BACKUP_STORAGE="$DEFAULT_BACKUP_STORAGE"
-EOF
-}
+  # choose shares (allow multiple)
+  echo
+  echo "Shares on //$server:"
+  idx=1
+  for s in "${shares[@]}"; do printf "%3d) %s\n" "$idx" "$s"; idx=$((idx+1)); done
+  read -rp "Enter share numbers to mount (comma-separated, e.g. 1,2) or 'all': " share_sel
+  sel_list=()
+  if [[ "${share_sel,,}" == "all" ]]; then
+    sel_list=("${shares[@]}")
+  else
+    IFS=',' read -ra arr2 <<<"$share_sel"
+    for v in "${arr2[@]}"; do v="${v// /}"; if [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=${#shares[@]} )); then sel_list+=("${shares[$((v-1))]}"); fi; done
+  fi
+  if (( ${#sel_list[@]} == 0 )); then
+    log "No shares selected for //$server"
+    continue
+  fi
 
-main() {
-  need_root
-  need_proxmox
+  # optional: ask default uid/gid to use for mount (use 0=root by default)
+  read -rp "Enter UID for mounted files (default 0=root): " uid
+  uid="${uid:-0}"
+  read -rp "Enter GID for mounted files (default 0=root): " gid
+  gid="${gid:-0}"
 
-  local action="menu"
-  while (( $# )); do
-    case "$1" in
-      --menu) action="menu";;
-      --update) action="update";;
-      --refresh-templates) action="refresh";;
-      --list-templates) action="list";;
-      --create-lxc) action="lxc";;
-      --create-vm) action="vm";;
-      --backup) action="backup";;
-      --update-all-lxc) action="update_all_lxc";;
-      --clean) action="clean";;
-      --dry-run) DRY_RUN=1;;
-      -h|--help) usage; exit 0;;
-      *) die "Unknown option: $1";;
-    esac
-    shift
+  for share in "${sel_list[@]}"; do
+    mountpath=$(create_mount_and_fstab_entry "$server" "$share" "$credfile" "$uid" "$gid")
+    CREATED_MOUNTS+=("$mountpath")
   done
+done
 
-  case "$action" in
-    menu) show_menu;;
-    update) task_update_system;;
-    refresh) task_refresh_templates;;
-    list) task_list_templates;;
-    lxc) task_create_lxc_interactive;;
-    vm) task_create_vm_interactive;;
-    backup) task_backup_interactive;;
-    update_all_lxc) task_update_all_lxc;;
-    clean) task_clean_images;;
-  esac
-}
+# After modifying fstab, inform systemd to reload and start automounts
+log "Reloading systemd daemon and triggering mount units..."
+systemctl daemon-reload >>"$LOGFILE" 2>&1 || true
+# Try to start automount units for created mounts
+for mp in "${CREATED_MOUNTS[@]}"; do
+  # generate unit name from path: replace / with -, remove leading -
+  unitname="$(echo "${mp}" | sed 's#/#-#g' | sed 's/^-//').automount"
+  if systemctl start "$unitname" >>"$LOGFILE" 2>&1; then
+    log "Started automount unit $unitname"
+  else
+    log "Could not start $unitname now; systemd should automount on access or after boot."
+  fi
+done
 
-main "$@"
+# final summary
+log "=== Summary ==="
+echo
+echo "Created credential files:"
+for f in "${CREATED_CRED_FILES[@]}"; do
+  printf " - %s (mode 600)\n" "$f"
+done
+echo
+echo "Created mountpoints and fstab entries:"
+for m in "${CREATED_MOUNTS[@]}"; do
+  printf " - %s\n" "$m"
+done
+echo
+echo "Log file: $LOGFILE"
+log "Script finished."
+
+# show content of created files list and fstab lines we added
+echo
+echo "---- fstab entries (relevant lines) ----"
+for s in "${CREATED_MOUNTS[@]}"; do
+  # show any fstab line that mounts to this path
+  grep -F " $(echo "$s" | sed 's/ /\\040/g')" "$FSTAB" || true
+done
+echo "----------------------------------------"
+
+echo
+echo "If you want to remove any added fstab entry, edit $FSTAB and remove the corresponding line. Credentials are stored under $CREDFOLDER (mode 600)."
+
+exit 0
